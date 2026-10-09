@@ -811,7 +811,7 @@ while [ -n "$(cat "$CG/app/cgroup.procs")" ] && [ "$i" -lt 20 ]; do sleep 0.1; i
             last_present, poll = observed, poll + 1
             self.healthy()
         require(repeated, "expiry repeat was not exercised before element disappearance")
-        require(largest_poll_gap + 1 < repeat_at,
+        require(largest_poll_gap + 1 < self.c["set_timeout_seconds"] / 2,
                 "NFT observation gap cannot distinguish original expiry from a repeated-write reset", Blocked)
         require(observed - expiry_start <= self.c["set_timeout_seconds"] + largest_poll_gap + 1,
                 "cached repeat appears to extend original nft expiry deadline")
