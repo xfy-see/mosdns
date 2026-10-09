@@ -61,19 +61,29 @@ def cold_query_prefix(namespace, label):
     return "q" + hashlib.sha256(basis.encode("ascii")).hexdigest()[:24] + "-", basis
 
 
-def validated_measurement(value, count, concurrency):
+def validated_measurement(value, count, concurrency, *, allow_timeouts=False):
     """Reject partial/invalid runs, including workers that never acquired work."""
     require(isinstance(value, dict), "load output must be a JSON object")
     require(value.get("queries") == count, "load query count differs")
     require(value.get("concurrency") == concurrency, "load concurrency differs")
     require(value.get("active_workers") == concurrency, "requested concurrency was not exercised")
-    require(value.get("errors") == 0 and value.get("error_types") == {}, "DNS response validation failed")
-    require(value.get("rcodes") == {"0": count}, "unexpected DNS response codes")
+    errors = value.get("errors")
+    error_types = value.get("error_types")
+    if allow_timeouts:
+        require(type(errors) is int and 0 <= errors <= count and isinstance(error_types, dict),
+                "invalid DNS error accounting")
+        require(all(re.fullmatch(r"read (?:udp|tcp) .+: i/o timeout", key)
+                    and type(number) is int and number > 0 for key, number in error_types.items())
+                and sum(error_types.values()) == errors, "only old-baseline read timeouts may continue")
+    else:
+        require(errors == 0 and error_types == {}, "DNS response validation failed")
+    successes = count - errors
+    require(value.get("rcodes") == ({"0": successes} if successes else {}), "unexpected DNS response codes")
     for key in ("seconds", "qps", "p50_ms", "p95_ms", "p99_ms", "max_ms", "mean_ms"):
         require(type(value.get(key)) in (int, float) and math.isfinite(value[key]) and value[key] >= 0,
                 "invalid numeric metric: " + key)
     require(value["seconds"] > 0, "nonpositive measured duration")
-    require(math.isclose(value["qps"], count / value["seconds"], rel_tol=1e-6), "QPS denominator differs")
+    require(math.isclose(value["qps"], successes / value["seconds"], rel_tol=1e-6), "QPS denominator differs")
     require(value["p50_ms"] <= value["p95_ms"] <= value["p99_ms"] <= value["max_ms"],
             "latency quantiles are not ordered")
     return value
@@ -338,35 +348,54 @@ class Lab:
         proc, group = self.spawn([getattr(self.args, profile), "start", "-c", self.output / "benchmark.json"],
                                  label + "-" + profile, limited=True)
         sampler = ResourceSampler(proc.pid)
+        value = None
+        resources = None
+        trial_error = None
         try:
             self.ready(proc)
             if mode == "hot":
                 # Probe every exact A/AAAA key before starting the timed load.
                 self.command([self.args.dnsbench, "-mode", "probe", "-addr", SERVER,
-                              "-file", self.output / "queries.txt", "-timeout", "1s"], "warmup")
+                              "-file", self.output / "queries.txt", "-timeout", "2s"], "warmup")
             argv = [self.args.dnsbench, "-mode", "load", "-addr", SERVER,
                     "-file", self.output / "queries.txt", "-net", network,
-                    "-n", str(count), "-c", str(concurrency), "-timeout", "1s", "-expect-mock"]
+                    "-n", str(count), "-c", str(concurrency), "-timeout", "2s", "-expect-mock"]
             prefix, prefix_basis = cold_query_prefix(self.args.namespace, label)
             if mode == "cold":
                 argv += ["-unique", "-prefix", prefix]
             value = validated_measurement(json.loads(self.command(argv, "load-" + label, timeout=180)),
-                                          count, concurrency)
+                                          count, concurrency, allow_timeouts=profile == "baseline")
             require(proc.poll() is None, "server exited during measurement")
-            resources = sampler.stop()
-            resources["cgroup"] = self.stop(proc, group)
-            proc = None
-            write_json(self.output / (label + "-resources.json"), resources)
-            return {"profile": profile, "cache": mode, **value,
-                    "resources": {k: v for k, v in resources.items() if k != "samples"},
-                    "rate_comparison_valid": value["seconds"] >= 2,
-                    "cold_query_prefix": prefix if mode == "cold" else None,
-                    "cold_query_prefix_basis": prefix_basis if mode == "cold" else None,
-                    "nft_writes_enabled": False}
+        except Exception as exc:
+            trial_error = str(exc)
+            raise
         finally:
-            if proc is not None:
-                sampler.stop()
-                self.stop(proc, group)
+            resources = sampler.stop()
+            resources["trial_error"] = trial_error
+            resources["query_timeout_seconds"] = 2
+            # Snapshot before stop(): even its OOM/cleanup assertion may raise.
+            resources["cgroup"] = {}
+            if group:
+                for file in ("memory.peak", "memory.events", "cpu.stat", "pids.events"):
+                    try:
+                        resources["cgroup"][file] = (group / file).read_text().strip()
+                    except OSError as exc:
+                        resources["cgroup"][file] = "read failed: " + str(exc)
+            try:
+                resources["cgroup"].update(self.stop(proc, group))
+            except Exception as exc:
+                resources["cleanup_error"] = str(exc)
+                raise
+            finally:
+                write_json(self.output / (label + "-resources.json"), resources)
+        return {"profile": profile, "cache": mode, **value,
+                "status": "failed" if value["errors"] else "passed",
+                "resources": {k: v for k, v in resources.items() if k != "samples"},
+                "rate_comparison_valid": value["seconds"] >= 2 and value["errors"] == 0,
+                "query_timeout_seconds": 2,
+                "cold_query_prefix": prefix if mode == "cold" else None,
+                "cold_query_prefix_basis": prefix_basis if mode == "cold" else None,
+                "nft_writes_enabled": False}
 
     def run(self):
         require(platform.system() == "Linux" and os.geteuid() == 0, "Linux root is required")
@@ -378,6 +407,7 @@ class Lab:
                     "architecture": platform.machine(), "GOMAXPROCS": 2, "GOMEMLIMIT": "48MiB",
                     "memory_max_bytes": 67108864, "pids_max": 64, "cpu_quota": "2 CPUs, no affinity",
                     "fixture_kind": "synthetic", "domain_count": DOMAIN_COUNT,
+                    "query_timeout_seconds": 2,
                     "baseline_commit": self.args.baseline_commit,
                     "binaries": {name: {"sha256": sha256(getattr(self.args, name)),
                                          "size_bytes": getattr(self.args, name).stat().st_size}
@@ -433,6 +463,7 @@ class Lab:
         cells = list(itertools.product(("hot", "cold"), ("udp", "tcp"), (1, 4)))
         counts = {}
         calibrations = []
+        write_json(self.output / "calibrations.json", calibrations)
         for cell_index, (mode, network, concurrency) in enumerate(cells):
             if self.args.requests:
                 counts[(mode, network, concurrency)] = self.args.requests
@@ -442,6 +473,7 @@ class Lab:
                 value = self.trial(profile, mode, network, concurrency, 3000,
                                    "calibration-%02d-%s" % (cell_index, profile))
                 calibrations.append(value)
+                write_json(self.output / "calibrations.json", calibrations)
                 qps.append(value["qps"])
             # Fix one query count for every paired profile/round in this cell.
             counts[(mode, network, concurrency)] = min(2000000, max(10000, math.ceil(max(qps) * 3.2)))
@@ -466,12 +498,16 @@ class Lab:
                     self.result["measurements"].append(row)
                     self.save()
         require(len(self.result["measurements"]) == 24 * self.args.rounds, "matrix incomplete")
-        short = [x["sample"] for x in self.result["measurements"] if not x["rate_comparison_valid"]]
-        self.check("controlled-matrix", {"samples": len(self.result["measurements"]),
-                                         "errors": 0, "samples_under_two_seconds": short})
+        short = [x["sample"] for x in self.result["measurements"] if x["seconds"] < 2]
+        error_count = sum(x["errors"] for x in self.result["measurements"])
+        calibration_errors = sum(x["errors"] for x in calibrations)
+        self.result["checks"].append({"name": "controlled-matrix", "status": "failed" if error_count or calibration_errors else "passed",
+            "detail": {"samples": len(self.result["measurements"]), "errors": error_count,
+                       "calibration_errors": calibration_errors, "samples_under_two_seconds": short}})
+        self.save()
         if short:
             self.result["limitations"].append("Some samples were shorter than two seconds and are excluded from rate comparisons: " + ", ".join(short))
-        self.result["status"] = "passed"
+        self.result["status"] = "failed" if error_count or calibration_errors else "passed"
 
     def cleanup(self):
         for proc in list(self.processes):

@@ -3,6 +3,9 @@ import copy
 import importlib.util
 from pathlib import Path
 import unittest
+from unittest import mock
+from types import SimpleNamespace
+import tempfile
 
 MODULE = Path(__file__).resolve().parents[2] / "scripts/testworkflow/hosted_lab.py"
 spec = importlib.util.spec_from_file_location("hosted_lab", MODULE)
@@ -31,6 +34,50 @@ class LoadValidation(unittest.TestCase):
                 row[key] = value
                 with self.assertRaises(RuntimeError):
                     lab.validated_measurement(row, 100, 4)
+
+    def test_baseline_timeouts_record_success_qps_without_relaxing_default(self):
+        row = dict(self.valid, errors=1, error_types={"read udp 127.0.0.1:1234->127.0.0.1:15353: i/o timeout": 1},
+                   rcodes={"0": 99}, qps=49.5)
+        self.assertEqual(lab.validated_measurement(row, 100, 4, allow_timeouts=True), row)
+        with self.assertRaises(RuntimeError):
+            lab.validated_measurement(row, 100, 4)
+        for change in ({"qps": 50}, {"rcodes": {"0": 100}},
+                       {"error_types": {"split answer validation failed": 1}},
+                       {"error_types": {"read udp 127.0.0.1:1->127.0.0.1:15353: i/o timeout": 2}}):
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                lab.validated_measurement(dict(row, **change), 100, 4, allow_timeouts=True)
+
+
+class FailureEvidence(unittest.TestCase):
+    def test_validation_failure_retains_sampler_and_cgroup_evidence(self):
+        for stop_error in (None, RuntimeError("server cgroup reported OOM")):
+            with self.subTest(stop_error=stop_error), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary)
+                group = output / "owned-group"
+                group.mkdir()
+                for name, text in {"memory.peak": "41943040", "memory.events": "oom 1\noom_kill 1",
+                                   "cpu.stat": "usage_usec 100", "pids.events": "max 0"}.items():
+                    (group / name).write_text(text)
+                args = SimpleNamespace(output=output, commit="a" * 40, namespace="mosdns-lab-" + "a" * 32,
+                                       baseline=Path("baseline"))
+                controller = lab.Lab(args)
+                controller.spawn = mock.Mock(return_value=(SimpleNamespace(pid=123), group))
+                controller.ready = mock.Mock(side_effect=RuntimeError("response validation failed"))
+                controller.stop = mock.Mock(return_value={}, side_effect=stop_error)
+                sampler = SimpleNamespace(stop=mock.Mock(return_value={"rss_peak_bytes": 41000000,
+                    "hwm_peak_bytes": 42000000, "process_cpu_seconds": 1.0, "samples": []}))
+                with mock.patch.object(lab, "ResourceSampler", return_value=sampler):
+                    with self.assertRaises(RuntimeError):
+                        controller.trial("baseline", "cold", "udp", 4, 3000, "calibration-05-baseline")
+                evidence = lab.json.loads((output / "calibration-05-baseline-resources.json").read_text())
+                self.assertEqual(evidence["rss_peak_bytes"], 41000000)
+                self.assertEqual(evidence["cgroup"]["memory.peak"], "41943040")
+                self.assertIn("oom_kill 1", evidence["cgroup"]["memory.events"])
+                self.assertEqual(evidence["trial_error"], "response validation failed")
+                self.assertEqual(evidence["query_timeout_seconds"], 2)
+                if stop_error:
+                    self.assertIn("OOM", evidence["cleanup_error"])
+                controller.stop.assert_called_once()
 
 
 class ProbeValidation(unittest.TestCase):
