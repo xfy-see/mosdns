@@ -526,7 +526,7 @@ NFTCHECK
         group_path = self.cg.removeprefix("/sys/fs/cgroup/") + "/app"
         level = len(group_path.split("/"))
         match = f'socket cgroupv2 level {level} "{group_path}"'
-        helpers_match = f'socket cgroupv2 level {level} "{group_path.rsplit("/", 1)[0]}/helpers"' 
+        helpers_match = f'socket cgroupv2 level {level} "{group_path.rsplit("/", 1)[0]}/helpers"'
         nft = f'''table inet {self.table} {{
  comment "mosdns-workflow-{self.owner}"
  counter direct {{ }}
