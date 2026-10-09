@@ -1,0 +1,40 @@
+name: Publish first Go release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/go-release.yml'
+      - 'scripts/publish-first-go-release.py'
+      - 'docs/releases/v5.3.4-opt.1.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: first-go-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'xfy-see/mosdns'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Download and verify the successful production build
+        run: |
+          python3 scripts/go-remote-build.py download \
+            --repo xfy-see/mosdns \
+            --commit c203ecd11bd8e8b897789bef8f9798dee80c987b \
+            --run-id 37875686901
+      - name: Publish verified assets
+        run: python3 scripts/publish-first-go-release.py
