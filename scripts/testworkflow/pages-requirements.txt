@@ -1,0 +1,2 @@
+# Pin the browser driver; install its matching Chromium with playwright install.
+playwright==1.55.0
