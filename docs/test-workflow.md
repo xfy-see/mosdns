@@ -33,7 +33,7 @@ hosted 已观测到旧 baseline 的 UDP/TCP 读取超时和 `dns: id mismatch`�
 
 ## 私有测试环境部署
 
-在能访问 131 的 Linux X64 机器安装 Python 3、OpenSSH 客户端及 Chromium 系统依赖。通过仓库 Settings → Actions → Runners → New self-hosted runner 获取官方 Linux X64 archive 及 SHA256，下载后运行：
+在能访问 131 的 Linux X64 机器安装 Python 3.9+（含 venv）、OpenSSH 客户端及 Chromium 系统依赖。通过仓库 Settings → Actions → Runners → New self-hosted runner 获取官方 Linux X64 archive 及 SHA256，下载后运行：
 
 ```sh
 bash scripts/testworkflow/install-runner.sh \
@@ -67,6 +67,8 @@ python3 scripts/testworkflow/router.py \
 正式执行在相同参数上使用 `--run`，页面测试再加 `--pages-script /absolute/checkout/scripts/testworkflow/pages.py`。输出目录必须是新目录；预检与正式阶段分开保存，失败样本不会被重试覆盖。
 
 设备阶段使用独占锁、唯一测试目录、独立端口和 nft 表，部署结束后关闭测试进程、删除本轮拥有的规则和目录，再验证设备状态恢复。真实 DNS 策略为：CN-site → 本次发现的默认 DNS、直连；其他域名 → `1.1.1.1:53`、WireGuard。国内首查 `223.5.5.5` 和按 CN-IP 筛选 DNS 回答不属于该策略。页面测试代理对匹配 CN-site 的域名或命中静态 CN-IP 的目标使用直连，其余使用 WireGuard；实际出口通过接口规则和计数验证。代理不读取动态学习集合，因此仅由学习集合决定出口的其他别名场景尚未覆盖，不能用 DNS 上游方向代替网站出口证明。
+
+设备阶段要求前置回归、构建和 hosted 阶段成功；即使 hosted 仅有旧 baseline 错误，它仍会失败并阻止部署 131。脚本已实现不代表实机测试已执行，最终报告分别记录这些状态。
 
 131 的受控矩阵先以配置中的 `benchmark.queries`（默认 2,000）执行独立校准，再按每个场景最快三个版本的观测，确定三版共用的固定查询数，目标时长为 `minimum_seconds + 1`、上限 100,000。校准单独标记 `excluded_from_formal`，不进入正式性能比较。正式矩阵热/冷 × UDP/TCP × 并发 1/4 × baseline/full/minimal × 两轮共 48 行；三版同一单元使用相同查询名及字节。显式关闭矩阵会使完整 `router131` suite 显示 `blocked`，保留已经执行的功能回归成绩。
 
