@@ -1,0 +1,265 @@
+name: Reproducible test plan
+run-name: Test plan ${{ github.sha }} router=${{ inputs.router || false }} pages=${{ inputs.pages || false }}
+
+on:
+  push:
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'tests/**'
+      - 'scripts/testworkflow/**'
+      - 'benchmarks/build-go-profiles.py'
+      - '.github/workflows/test-plan.yml'
+  pull_request:
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'tests/**'
+      - 'scripts/testworkflow/**'
+      - 'benchmarks/build-go-profiles.py'
+      - '.github/workflows/test-plan.yml'
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Exact 40-character main commit to test
+        required: true
+        type: string
+      router:
+        description: Run real OpenWrt tests on the private mosdns-lab runner
+        default: false
+        type: boolean
+      pages:
+        description: Also visit QQ/Taobao and replay their DNS names on 131 (requires router)
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GOTOOLCHAIN: local
+  GOENV: 'off'
+  GOWORK: 'off'
+  GOFLAGS: ''
+  GOEXPERIMENT: ''
+  CGO_ENABLED: '0'
+  GOAMD64: v1
+  GOARM64: v8.0
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {id: unit-full, profile: full, race: false}
+          - {id: unit-minimal, profile: minimal, race: false}
+          - {id: unit-full-pprof, profile: full-pprof, race: false}
+          - {id: race-full, profile: full, race: true}
+          - {id: race-minimal, profile: minimal, race: true}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.0'
+          check-latest: false
+      - name: Validate request
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+          REQUEST_PAGES: ${{ inputs.pages }}
+          REQUEST_ROUTER: ${{ inputs.router }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(go env GOVERSION)" = go1.26.0
+          if test "$GITHUB_EVENT_NAME" = workflow_dispatch; then
+            test "$GITHUB_SHA" = "$EXPECTED_COMMIT"
+            if test "$REQUEST_ROUTER" = true; then test "$GITHUB_REF" = refs/heads/main; fi
+            if test "$REQUEST_PAGES" = true; then test "$REQUEST_ROUTER" = true; fi
+          fi
+      - name: Run versioned regression controller
+        env:
+          PROFILE: ${{ matrix.profile }}
+          RACE: ${{ matrix.race }}
+          SUITE: ${{ matrix.id }}
+        run: |
+          extra=()
+          if test "$RACE" = true; then export CGO_ENABLED=1; extra=(--race); fi
+          python3 scripts/testworkflow/validate.py --profile "$PROFILE" "${extra[@]}" \
+            --commit "$GITHUB_SHA" --output ".build/test-plan/$SUITE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-plan-${{ matrix.id }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: .build/test-plan/
+          if-no-files-found: warn
+          retention-days: 30
+
+  build:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.0'
+          check-latest: false
+      - name: Build baseline, full, minimal and test helpers remotely
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          python3 scripts/testworkflow/build.py --arch "$TARGET_ARCH" \
+            --commit "$GITHUB_SHA" --output .build/test-plan-bundle
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-plan-build-${{ matrix.arch }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            .build/test-plan-bundle/bundle.json
+            .build/test-plan-bundle/results.json
+            .build/test-plan-bundle/build.log
+            .build/test-plan-bundle/mosdns-*
+            .build/test-plan-bundle/dnsbench
+            .build/test-plan-bundle/routerproxy
+            .build/test-plan-bundle/profiles/manifest.json
+            .build/test-plan-bundle/profiles/*-build.log
+          if-no-files-found: error
+          retention-days: 30
+
+  hosted:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-plan-build-amd64-${{ github.sha }}-${{ github.run_attempt }}
+          path: .build/artifacts
+      - name: Deploy isolated Linux test environment
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq iproute2 nftables
+          sudo bash scripts/testworkflow/deploy-lab.sh --check
+      - name: Run deterministic baseline and nftset matrix
+        run: |
+          chmod +x .build/artifacts/mosdns-* .build/artifacts/dnsbench
+          sudo -E python3 scripts/testworkflow/hosted_lab.py --commit "$GITHUB_SHA" \
+            --baseline-commit 9cfb7ce985599c087cb7ccfb1531d0c0f4021242 \
+            --full "$PWD/.build/artifacts/mosdns-full" --minimal "$PWD/.build/artifacts/mosdns-minimal" \
+            --baseline "$PWD/.build/artifacts/mosdns-baseline" --dnsbench "$PWD/.build/artifacts/dnsbench" \
+            --output "$PWD/.build/test-plan/hosted"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-plan-hosted-${{ github.sha }}-${{ github.run_attempt }}
+          path: .build/test-plan/hosted/
+          if-no-files-found: warn
+          retention-days: 30
+
+  router131:
+    # A private runner never executes PR code or a manually selected branch.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.router
+    needs: [validate, build, hosted]
+    runs-on: [self-hosted, Linux, X64, mosdns-lab]
+    environment: router131
+    concurrency:
+      group: mosdns-router131
+      cancel-in-progress: false
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-plan-build-arm64-${{ github.sha }}-${{ github.run_attempt }}
+          path: .build/artifacts
+      - name: Prepare browser dependency only when requested
+        if: inputs.pages
+        run: |
+          python3 -m venv "$RUNNER_TEMP/mosdns-pages-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          "$RUNNER_TEMP/mosdns-pages-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/bin/pip" install -r scripts/testworkflow/pages-requirements.txt
+          "$RUNNER_TEMP/mosdns-pages-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/bin/python" -m playwright install chromium
+      - name: Preflight, deploy, test and restore owned device state
+        env:
+          # Private file lives outside checkout; never copy it into artifacts.
+          MOSDNS_ROUTER_CONFIG: ${{ vars.MOSDNS_ROUTER_CONFIG }}
+          REQUEST_PAGES: ${{ inputs.pages }}
+        run: |
+          test -n "$MOSDNS_ROUTER_CONFIG"
+          runtime=python3
+          extra=()
+          if test "$REQUEST_PAGES" = true; then
+            runtime="$RUNNER_TEMP/mosdns-pages-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/bin/python"
+            extra=(--pages-script "$PWD/scripts/testworkflow/pages.py")
+          fi
+          "$runtime" scripts/testworkflow/router.py --run --config "$MOSDNS_ROUTER_CONFIG" \
+            --artifacts "$PWD/.build/artifacts" --commit "$GITHUB_SHA" \
+            --output "$PWD/.build/test-plan/router131" "${extra[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-plan-router131-${{ github.sha }}-${{ github.run_attempt }}
+          path: .build/test-plan/router131/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Remove temporary browser runtime
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/mosdns-pages-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+
+  report:
+    if: always()
+    needs: [validate, build, hosted, router131]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: test-plan-*
+          path: .build/test-plan-evidence
+      - name: Show results and enforce required stages
+        env:
+          REQUEST_ROUTER: ${{ inputs.router }}
+          REQUEST_PAGES: ${{ inputs.pages }}
+        run: |
+          mkdir -p .build/test-plan-evidence
+          required=unit-full,unit-minimal,unit-full-pprof,race-full,race-minimal,build-amd64,build-arm64,hosted
+          if test "$REQUEST_ROUTER" = true; then required="$required,router131"; fi
+          if test "$REQUEST_PAGES" = true; then required="$required,pages131"; fi
+          python3 scripts/testworkflow/report.py --input .build/test-plan-evidence \
+            --output .build/test-plan-report --commit "$GITHUB_SHA" \
+            --required-suites "$required" --github-summary "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-plan-report-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            .build/test-plan-report/
+            .build/test-plan-evidence/
+          if-no-files-found: error
+          retention-days: 30
