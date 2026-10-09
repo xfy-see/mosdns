@@ -61,7 +61,7 @@ def cold_query_prefix(namespace, label):
     return "q" + hashlib.sha256(basis.encode("ascii")).hexdigest()[:24] + "-", basis
 
 
-def validated_measurement(value, count, concurrency, *, allow_timeouts=False):
+def validated_measurement(value, count, concurrency, *, allow_baseline_errors=False):
     """Reject partial/invalid runs, including workers that never acquired work."""
     require(isinstance(value, dict), "load output must be a JSON object")
     require(value.get("queries") == count, "load query count differs")
@@ -69,12 +69,13 @@ def validated_measurement(value, count, concurrency, *, allow_timeouts=False):
     require(value.get("active_workers") == concurrency, "requested concurrency was not exercised")
     errors = value.get("errors")
     error_types = value.get("error_types")
-    if allow_timeouts:
+    if allow_baseline_errors:
         require(type(errors) is int and 0 <= errors <= count and isinstance(error_types, dict),
                 "invalid DNS error accounting")
-        require(all(re.fullmatch(r"read (?:udp|tcp) .+: i/o timeout", key)
+        require(all((key == "dns: id mismatch" or re.fullmatch(r"read (?:udp|tcp) .+: i/o timeout", key))
                     and type(number) is int and number > 0 for key, number in error_types.items())
-                and sum(error_types.values()) == errors, "only old-baseline read timeouts may continue")
+                and sum(error_types.values()) == errors,
+                "only recorded old-baseline read timeouts/ID mismatches may continue")
     else:
         require(errors == 0 and error_types == {}, "DNS response validation failed")
     successes = count - errors
@@ -364,7 +365,7 @@ class Lab:
             if mode == "cold":
                 argv += ["-unique", "-prefix", prefix]
             value = validated_measurement(json.loads(self.command(argv, "load-" + label, timeout=180)),
-                                          count, concurrency, allow_timeouts=profile == "baseline")
+                                          count, concurrency, allow_baseline_errors=profile == "baseline")
             require(proc.poll() is None, "server exited during measurement")
         except Exception as exc:
             trial_error = str(exc)
@@ -408,6 +409,7 @@ class Lab:
                     "memory_max_bytes": 67108864, "pids_max": 64, "cpu_quota": "2 CPUs, no affinity",
                     "fixture_kind": "synthetic", "domain_count": DOMAIN_COUNT,
                     "query_timeout_seconds": 2,
+                    "baseline_error_collection_policy": "Collect read UDP/TCP i/o timeouts and exact dns: id mismatch as failed noncomparable rows; suite remains failed",
                     "baseline_commit": self.args.baseline_commit,
                     "binaries": {name: {"sha256": sha256(getattr(self.args, name)),
                                          "size_bytes": getattr(self.args, name).stat().st_size}

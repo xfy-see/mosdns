@@ -29,6 +29,8 @@ hosted 基准一次只运行一个版本。热缓存先预热，冷缓存使用�
 
 QPS 为成功请求数除以整行持续时间；P50/P95/P99 只统计成功 exchange。错误、超时、RSS/HWM、cgroup 信息与性能指标分别记录。资源限制使用已经委派的 cgroup 控制器；hosted 使用 64 MiB 内存上限和 `GOMEMLIMIT=48MiB`，控制器不可用时记录覆盖限制，不修改 root 控制器。它与此前 131 的 32 MiB 历史矩阵属于不同环境，不能直接拼接比较。
 
+hosted 已观测到旧 baseline 的 UDP/TCP 读取超时和 `dns: id mismatch`。仅这两类 baseline 错误允许继续收集剩余矩阵；该行仍标为失败，排除性能比较，整个 suite 仍失败。full/minimal 的任何错误、错误回答或未识别的 baseline 错误会立即终止，保留原始日志与资源记录。所有版本使用相同的 2 秒查询期限。
+
 ## 私有测试环境部署
 
 在能访问 131 的 Linux X64 机器安装 Python 3、OpenSSH 客户端及 Chromium 系统依赖。通过仓库 Settings → Actions → Runners → New self-hosted runner 获取官方 Linux X64 archive 及 SHA256，下载后运行：
@@ -64,7 +66,7 @@ python3 scripts/testworkflow/router.py \
 
 正式执行在相同参数上使用 `--run`，页面测试再加 `--pages-script /absolute/checkout/scripts/testworkflow/pages.py`。输出目录必须是新目录；预检与正式阶段分开保存，失败样本不会被重试覆盖。
 
-设备阶段使用独占锁、唯一测试目录、独立端口和 nft 表，部署结束后关闭测试进程、删除本轮拥有的规则和目录，再验证设备状态恢复。真实 DNS 策略为：CN-site → 本次发现的默认 DNS、直连；其他域名 → `1.1.1.1:53`、WireGuard。国内首查 `223.5.5.5` 和按 CN-IP 筛选 DNS 回答不属于该策略。网站连接按静态 CN-IP 或学习集合决定出口，不能用 DNS 上游方向代替网站出口证明。
+设备阶段使用独占锁、唯一测试目录、独立端口和 nft 表，部署结束后关闭测试进程、删除本轮拥有的规则和目录，再验证设备状态恢复。真实 DNS 策略为：CN-site → 本次发现的默认 DNS、直连；其他域名 → `1.1.1.1:53`、WireGuard。国内首查 `223.5.5.5` 和按 CN-IP 筛选 DNS 回答不属于该策略。页面测试代理对匹配 CN-site 的域名或命中静态 CN-IP 的目标使用直连，其余使用 WireGuard；实际出口通过接口规则和计数验证。代理不读取动态学习集合，因此仅由学习集合决定出口的其他别名场景尚未覆盖，不能用 DNS 上游方向代替网站出口证明。
 
 131 的受控矩阵先以配置中的 `benchmark.queries`（默认 2,000）执行独立校准，再按每个场景最快三个版本的观测，确定三版共用的固定查询数，目标时长为 `minimum_seconds + 1`、上限 100,000。校准单独标记 `excluded_from_formal`，不进入正式性能比较。正式矩阵热/冷 × UDP/TCP × 并发 1/4 × baseline/full/minimal × 两轮共 48 行；三版同一单元使用相同查询名及字节。显式关闭矩阵会使完整 `router131` suite 显示 `blocked`，保留已经执行的功能回归成绩。
 
@@ -94,7 +96,7 @@ python3 scripts/testworkflow/router.py \
 
 ## 本地查看和重新生成报告
 
-本地负责代码编辑、下载产物和检查证据。下载某次 workflow 的结果 artifact，保持各 suite 子目录及原始文件的相对结构；打开 `report/report.html`，或者重新生成：
+本地负责代码编辑、下载产物和检查证据。下载某次 workflow 的结果 artifact，保持各 suite 子目录及原始文件的相对结构；打开 `test-plan-report/report.html`，或者重新生成：
 
 ```sh
 gh run download RUN_ID --repo xfy-see/mosdns \
@@ -105,8 +107,8 @@ gh run download RUN_ID --repo xfy-see/mosdns \
 
 ```sh
 python3 scripts/testworkflow/report.py \
-  --input .build/test-plan/RUN_ID/evidence \
-  --output .build/test-plan/RUN_ID/report \
+  --input .build/test-plan/RUN_ID/test-plan-evidence \
+  --output .build/test-plan/RUN_ID/test-plan-report \
   --commit FULL_40_CHARACTER_COMMIT_SHA \
   --required-suites unit-full,unit-minimal,unit-full-pprof,race-full,race-minimal,build-amd64,build-arm64,hosted
 ```

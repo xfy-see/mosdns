@@ -38,14 +38,25 @@ class LoadValidation(unittest.TestCase):
     def test_baseline_timeouts_record_success_qps_without_relaxing_default(self):
         row = dict(self.valid, errors=1, error_types={"read udp 127.0.0.1:1234->127.0.0.1:15353: i/o timeout": 1},
                    rcodes={"0": 99}, qps=49.5)
-        self.assertEqual(lab.validated_measurement(row, 100, 4, allow_timeouts=True), row)
+        self.assertEqual(lab.validated_measurement(row, 100, 4, allow_baseline_errors=True), row)
         with self.assertRaises(RuntimeError):
             lab.validated_measurement(row, 100, 4)
         for change in ({"qps": 50}, {"rcodes": {"0": 100}},
                        {"error_types": {"split answer validation failed": 1}},
                        {"error_types": {"read udp 127.0.0.1:1->127.0.0.1:15353: i/o timeout": 2}}):
             with self.subTest(change=change), self.assertRaises(RuntimeError):
-                lab.validated_measurement(dict(row, **change), 100, 4, allow_timeouts=True)
+                lab.validated_measurement(dict(row, **change), 100, 4, allow_baseline_errors=True)
+
+    def test_observed_baseline_id_mismatch_class_keeps_strict_optimized_policy(self):
+        row = dict(self.valid, errors=3, error_types={"dns: id mismatch": 2,
+                   "read tcp 127.0.0.1:1234->127.0.0.1:15353: i/o timeout": 1},
+                   rcodes={"0": 97}, qps=48.5)
+        self.assertEqual(lab.validated_measurement(row, 100, 4, allow_baseline_errors=True), row)
+        with self.assertRaises(RuntimeError):
+            lab.validated_measurement(row, 100, 4)
+        for error in ("dns: id mismatch (unknown)", "response validation failed", "split answer validation failed"):
+            with self.subTest(error=error), self.assertRaises(RuntimeError):
+                lab.validated_measurement(dict(row, error_types={error: 3}), 100, 4, allow_baseline_errors=True)
 
 
 class FailureEvidence(unittest.TestCase):
