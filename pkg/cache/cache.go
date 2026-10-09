@@ -90,7 +90,11 @@ func (c *Cache[K, V]) Close() error {
 func (c *Cache[K, V]) Get(key K) (v V, expirationTime time.Time, ok bool) {
 	if e, hasEntry := c.m.Get(key); hasEntry {
 		if e.expirationTime.Before(time.Now()) {
-			c.m.Del(key)
+			// A Store may replace e after Get released its read lock. Remove
+			// only the expired version that this lookup actually observed.
+			c.m.TestAndSet(key, func(current *elem[V], ok bool) (*elem[V], bool, bool) {
+				return nil, false, ok && current == e
+			})
 			return
 		}
 		return e.v, e.expirationTime, true

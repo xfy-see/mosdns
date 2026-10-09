@@ -1,3 +1,5 @@
+//go:build !mosdns_minimal
+
 /*
  * Copyright (C) 2020-2022, IrineSistiana
  *
@@ -32,7 +34,6 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/IrineSistiana/mosdns/v5/plugin/server/server_utils"
 	"go.uber.org/zap"
-	"golang.org/x/net/http2"
 )
 
 const PluginType = "http_server"
@@ -102,20 +103,7 @@ func StartServer(bp *coremain.BP, args *Args) (*HttpServer, error) {
 	}
 	bp.L().Info("http server started", zap.Stringer("addr", l.Addr()))
 
-	hs := &http.Server{
-		Handler:        mux,
-		ReadTimeout:    time.Second,
-		IdleTimeout:    time.Duration(args.IdleTimeout) * time.Second,
-		MaxHeaderBytes: 512,
-	}
-	if err := http2.ConfigureServer(hs, &http2.Server{
-		MaxReadFrameSize:             16 * 1024,
-		IdleTimeout:                  time.Duration(args.IdleTimeout) * time.Second,
-		MaxUploadBufferPerConnection: 65535,
-		MaxUploadBufferPerStream:     65535,
-	}); err != nil {
-		return nil, fmt.Errorf("failed to setup http2 server, %w", err)
-	}
+	hs := newHTTPServer(mux, args)
 
 	go func() {
 		var err error
@@ -130,4 +118,18 @@ func StartServer(bp *coremain.BP, args *Args) (*HttpServer, error) {
 		args:   args,
 		server: hs,
 	}, nil
+}
+
+func newHTTPServer(handler http.Handler, args *Args) *http.Server {
+	return &http.Server{
+		Handler:        handler,
+		ReadTimeout:    time.Second,
+		IdleTimeout:    time.Duration(args.IdleTimeout) * time.Second,
+		MaxHeaderBytes: 512,
+		HTTP2: &http.HTTP2Config{
+			MaxReadFrameSize:              16 * 1024,
+			MaxReceiveBufferPerConnection: 65535,
+			MaxReceiveBufferPerStream:     65535,
+		},
+	}
 }

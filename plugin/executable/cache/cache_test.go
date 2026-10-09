@@ -1,3 +1,5 @@
+//go:build !mosdns_minimal
+
 /*
  * Copyright (C) 2020-2022, IrineSistiana
  *

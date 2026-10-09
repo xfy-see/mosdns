@@ -3,12 +3,8 @@ import argparse
 import logging
 import os
 import subprocess
+import sys
 import zipfile
-
-parser = argparse.ArgumentParser()
-parser.add_argument("-upx", action="store_true")
-parser.add_argument("-i", type=int)
-args = parser.parse_args()
 
 PROJECT_NAME = 'mosdns'
 RELEASE_DIR = './release'
@@ -47,27 +43,31 @@ envs = [
     [['GOOS', 'windows'], ['GOARCH', 'amd64']],
 ]
 
+parser = argparse.ArgumentParser()
+parser.add_argument("-upx", action="store_true")
+parser.add_argument("-i", type=int, choices=range(len(envs)), metavar="INDEX")
+args = parser.parse_args()
+
 
 def go_build():
     logger.info(f'building {PROJECT_NAME}')
 
-    global envs
-    if args.i:
-        envs = [envs[args.i]]
+    selected_envs = envs if args.i is None else [envs[args.i]]
+    failed_targets = []
 
     VERSION = 'dev/unknown'
     try:
-        VERSION = subprocess.check_output('git describe --tags --long --always', shell=True).decode().rstrip()
-    except subprocess.CalledProcessError as e:
+        VERSION = subprocess.check_output(['git', 'describe', '--tags', '--long', '--always']).decode().rstrip()
+    except (subprocess.CalledProcessError, OSError) as e:
         logger.error(f'get git tag failed: {e.args}')
 
     try:
-        subprocess.check_call('go run ../ config gen config.yaml', shell=True, env=os.environ)
+        subprocess.check_call(['go', 'run', '../', 'config', 'gen', 'config.yaml'], env=os.environ)
     except Exception:
         logger.exception('failed to generate config template')
         raise
 
-    for env in envs:
+    for env in selected_envs:
         os_env = os.environ.copy()  # new env
 
         s = PROJECT_NAME
@@ -82,14 +82,14 @@ def go_build():
         logger.info(f'building {zip_filename}')
         try:
             subprocess.check_call(
-                f'go build -ldflags "-s -w -X main.version={VERSION}" -trimpath -o {bin_filename} ../', shell=True,
+                ['go', 'build', '-ldflags', f'-s -w -X main.version={VERSION}', '-trimpath', '-o', bin_filename, '../'],
                 env=os_env)
 
             if args.upx:
                 try:
-                    subprocess.check_call(f'upx -9 -q {bin_filename}', shell=True, stderr=subprocess.DEVNULL,
+                    subprocess.check_call(['upx', '-9', '-q', bin_filename], stderr=subprocess.DEVNULL,
                                           stdout=subprocess.DEVNULL)
-                except subprocess.CalledProcessError as e:
+                except (subprocess.CalledProcessError, OSError) as e:
                     logger.error(f'upx failed: {e.args}')
 
             with zipfile.ZipFile(zip_filename, mode='w', compression=zipfile.ZIP_DEFLATED,
@@ -100,12 +100,18 @@ def go_build():
                 zf.write('../LICENSE', 'LICENSE')
 
         except subprocess.CalledProcessError as e:
+            failed_targets.append(s)
             logger.error(f'build {zip_filename} failed: {e.args}')
         except Exception:
+            failed_targets.append(s)
             logger.exception('unknown err')
 
+    if failed_targets:
+        logger.error('failed release targets: %s', ', '.join(failed_targets))
+    return not failed_targets
 
-if __name__ == '__main__':
+
+def main():
     logging.basicConfig(level=logging.INFO)
 
     if len(RELEASE_DIR) != 0:
@@ -113,4 +119,8 @@ if __name__ == '__main__':
             os.mkdir(RELEASE_DIR)
         os.chdir(RELEASE_DIR)
 
-    go_build()
+    return 0 if go_build() else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,184 @@
+name: Go profiles
+run-name: Go profiles ${{ github.sha }} ${{ inputs.request_id || github.event_name }}
+
+on:
+  push:
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'tests/fixtures/**'
+      - 'tests/profiles/**'
+      - 'tests/test_go_remote_build.py'
+      - 'tests/test_release.py'
+      - 'benchmarks/build-go-profiles.py'
+      - 'scripts/go-remote-build.py'
+      - '.github/workflows/go-profiles.yml'
+  pull_request:
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'tests/fixtures/**'
+      - 'tests/profiles/**'
+      - 'tests/test_go_remote_build.py'
+      - 'tests/test_release.py'
+      - 'benchmarks/build-go-profiles.py'
+      - 'scripts/go-remote-build.py'
+      - '.github/workflows/go-profiles.yml'
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Exact 40-character commit SHA to build
+        required: true
+        type: string
+      request_id:
+        description: Optional identifier used by the local waiting client
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GOTOOLCHAIN: local
+  GOENV: 'off'
+  GOWORK: 'off'
+  GOFLAGS: ''
+  GOEXPERIMENT: ''
+  CGO_ENABLED: '0'
+  GOAMD64: v1
+  GOARM64: v8.0
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [full, minimal, full-pprof]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.0'
+          check-latest: false
+          cache: true
+      - name: Check selected commit and compiler
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          if test "$GITHUB_EVENT_NAME" = workflow_dispatch; then
+            test "$GITHUB_SHA" = "$EXPECTED_COMMIT"
+          fi
+          test "$(go env GOVERSION)" = go1.26.0
+      - name: Python release and download verifier tests
+        if: matrix.profile == 'full'
+        run: |
+          python3 -m unittest discover -s tests -p 'test_release.py'
+          python3 -m unittest discover -s tests -p 'test_go_remote_build.py'
+      - name: Complete profile tests
+        env:
+          PROFILE: ${{ matrix.profile }}
+        run: |
+          mkdir -p .build/ci-test
+          tags=()
+          case "$PROFILE" in
+            minimal) tags=(-tags=mosdns_minimal) ;;
+            full-pprof) tags=(-tags=pprof) ;;
+          esac
+          go test -mod=readonly -p=2 -parallel=2 -count=1 -json "${tags[@]}" ./... 2>&1 | tee ".build/ci-test/$PROFILE.jsonl"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: go-tests-${{ matrix.profile }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: .build/ci-test/
+          if-no-files-found: warn
+          retention-days: 14
+
+  race:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [full, minimal]
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.0'
+          check-latest: false
+          cache: true
+      - name: Key package race tests
+        env:
+          PROFILE: ${{ matrix.profile }}
+        run: |
+          test "$(go env GOVERSION)" = go1.26.0
+          mkdir -p .build/ci-race
+          tags=()
+          if test "$PROFILE" = minimal; then tags=(-tags=mosdns_minimal); fi
+          go test -mod=readonly -p=2 -parallel=2 -count=1 -race -json "${tags[@]}" \
+            ./pkg/matcher/domain ./pkg/query_context ./pkg/cache \
+            ./pkg/concurrent_map ./plugin/executable/cache 2>&1 | tee ".build/ci-race/$PROFILE.jsonl"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: go-race-${{ matrix.profile }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: .build/ci-race/
+          if-no-files-found: warn
+          retention-days: 14
+
+  build:
+    # PR checks use a synthetic merge commit; publish only runs whose API
+    # head_sha is the exact checkout commit used by the downloader.
+    if: github.event_name != 'pull_request'
+    needs: [test, race]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [arm64, amd64]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.0'
+          check-latest: false
+          cache: true
+      - name: Build frozen Linux profiles
+        env:
+          TARGET_ARCH: ${{ matrix.goarch }}
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: |
+          if test "$GITHUB_EVENT_NAME" = workflow_dispatch; then
+            test "$GITHUB_SHA" = "$EXPECTED_COMMIT"
+          fi
+          test "$(go env GOVERSION)" = go1.26.0
+          python3 benchmarks/build-go-profiles.py \
+            --go "$(command -v go)" --goos linux --goarch "$TARGET_ARCH" \
+            --profile both --version "git-$GITHUB_SHA" \
+            --output ".build/ci-go-linux-$TARGET_ARCH"
+          python3 scripts/go-remote-build.py package \
+            --build-dir ".build/ci-go-linux-$TARGET_ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mosdns-go-linux-${{ matrix.goarch }}-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: .build/ci-go-linux-${{ matrix.goarch }}/dist/
+          if-no-files-found: error
+          retention-days: 30

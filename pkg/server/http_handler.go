@@ -1,3 +1,5 @@
+//go:build !mosdns_minimal
+
 /*
  * Copyright (C) 2020-2022, IrineSistiana
  *
@@ -146,11 +148,13 @@ func ReadMsgFromReq(req *http.Request) (*dns.Msg, error) {
 			return nil, fmt.Errorf("msg length %d is too big", msgSize)
 		}
 
-		var err error
-		b, err = base64.RawURLEncoding.DecodeString(s)
+		decoded := pool.GetBuf(msgSize)
+		defer pool.ReleaseBuf(decoded)
+		n, err := base64.RawURLEncoding.Decode(*decoded, []byte(s))
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode base64 query: %w", err)
 		}
+		b = (*decoded)[:n]
 
 	case http.MethodPost:
 		// Check Content-Type header
@@ -160,9 +164,14 @@ func ReadMsgFromReq(req *http.Request) (*dns.Msg, error) {
 
 		buf := bufPool.Get()
 		defer bufPool.Release(buf)
-		_, err := buf.ReadFrom(io.LimitReader(req.Body, dns.MaxMsgSize))
+		// Read one extra byte so an oversized body cannot be silently truncated
+		// to a valid DNS prefix, including requests without a Content-Length.
+		_, err := buf.ReadFrom(io.LimitReader(req.Body, dns.MaxMsgSize+1))
 		if err != nil {
 			return nil, fmt.Errorf("failed to read request body: %w", err)
+		}
+		if buf.Len() > dns.MaxMsgSize {
+			return nil, fmt.Errorf("msg length exceeds %d", dns.MaxMsgSize)
 		}
 		b = buf.Bytes()
 	default:

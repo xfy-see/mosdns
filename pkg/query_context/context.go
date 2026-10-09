@@ -182,9 +182,13 @@ func (ctx *Context) CopyTo(d *Context) *Context {
 
 	if ctx.resp != nil {
 		d.resp = ctx.resp.Copy()
+	} else {
+		d.resp = nil
 	}
 	if ctx.respOpt != nil {
 		d.respOpt = dns.Copy(ctx.respOpt).(*dns.OPT)
+	} else {
+		d.respOpt = nil
 	}
 	d.upstreamOpt = ctx.upstreamOpt
 

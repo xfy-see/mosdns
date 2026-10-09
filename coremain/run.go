@@ -22,15 +22,12 @@ package coremain
 import (
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v5/mlog"
-	"github.com/kardianos/service"
+	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/go-viper/mapstructure/v2"
-	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 	"go.uber.org/zap"
 	"os"
-	"os/signal"
+	"path/filepath"
 	"runtime"
-	"syscall"
 )
 
 type serverFlags struct {
@@ -38,73 +35,6 @@ type serverFlags struct {
 	dir       string
 	cpu       int
 	asService bool
-}
-
-var rootCmd = &cobra.Command{
-	Use: "mosdns",
-}
-
-func init() {
-	sf := new(serverFlags)
-	startCmd := &cobra.Command{
-		Use:   "start [-c config_file] [-d working_dir]",
-		Short: "Start mosdns main program.",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if sf.asService {
-				svc, err := service.New(&serverService{f: sf}, svcCfg)
-				if err != nil {
-					return fmt.Errorf("failed to init service, %w", err)
-				}
-				return svc.Run()
-			}
-
-			m, err := NewServer(sf)
-			if err != nil {
-				return err
-			}
-
-			go func() {
-				c := make(chan os.Signal, 1)
-				signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
-				sig := <-c
-				m.logger.Warn("signal received", zap.Stringer("signal", sig))
-				m.sc.SendCloseSignal(nil)
-			}()
-			return m.GetSafeClose().WaitClosed()
-		},
-		DisableFlagsInUseLine: true,
-		SilenceUsage:          true,
-	}
-	rootCmd.AddCommand(startCmd)
-	fs := startCmd.Flags()
-	fs.StringVarP(&sf.c, "config", "c", "", "config file")
-	fs.StringVarP(&sf.dir, "dir", "d", "", "working dir")
-	fs.IntVar(&sf.cpu, "cpu", 0, "set runtime.GOMAXPROCS")
-	fs.BoolVar(&sf.asService, "as-service", false, "start as a service")
-	_ = fs.MarkHidden("as-service")
-
-	serviceCmd := &cobra.Command{
-		Use:   "service",
-		Short: "Manage mosdns as a system service.",
-	}
-	serviceCmd.PersistentPreRunE = initService
-	serviceCmd.AddCommand(
-		newSvcInstallCmd(),
-		newSvcUninstallCmd(),
-		newSvcStartCmd(),
-		newSvcStopCmd(),
-		newSvcRestartCmd(),
-		newSvcStatusCmd(),
-	)
-	rootCmd.AddCommand(serviceCmd)
-}
-
-func AddSubCmd(c *cobra.Command) {
-	rootCmd.AddCommand(c)
-}
-
-func Run() error {
-	return rootCmd.Execute()
 }
 
 func NewServer(sf *serverFlags) (*Mosdns, error) {
@@ -129,31 +59,47 @@ func NewServer(sf *serverFlags) (*Mosdns, error) {
 	return NewMosdns(cfg)
 }
 
-// loadConfig load a config from a file. If filePath is empty, it will
-// automatically search and load a file which name start with "config".
+// loadConfig reads YAML/YML or JSON. An empty path searches the working
+// directory for config.json, config.yaml, then config.yml.
 func loadConfig(filePath string) (*Config, string, error) {
-	v := viper.New()
-
-	if len(filePath) > 0 {
-		v.SetConfigFile(filePath)
-	} else {
-		v.SetConfigName("config")
-		v.AddConfigPath(".")
+	if filePath == "" {
+		dir, err := os.Getwd()
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to read config: %w", err)
+		}
+		for _, name := range []string{"config.json", "config.yaml", "config.yml"} {
+			candidate := filepath.Join(dir, name)
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+				filePath = candidate
+				break
+			}
+		}
+		if filePath == "" {
+			return nil, "", fmt.Errorf("failed to read config: config.json, config.yaml or config.yml not found in %s", dir)
+		}
 	}
 
-	if err := v.ReadInConfig(); err != nil {
+	settings, err := utils.ReadConfigMap(filePath)
+	if err != nil {
 		return nil, "", fmt.Errorf("failed to read config: %w", err)
 	}
 
-	decoderOpt := func(cfg *mapstructure.DecoderConfig) {
-		cfg.ErrorUnused = true
-		cfg.TagName = "yaml"
-		cfg.WeaklyTypedInput = true
-	}
-
 	cfg := new(Config)
-	if err := v.Unmarshal(cfg, decoderOpt); err != nil {
+	decoder, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
+		Result:           cfg,
+		ErrorUnused:      true,
+		TagName:          "yaml",
+		WeaklyTypedInput: true,
+		DecodeHook: mapstructure.ComposeDecodeHookFunc(
+			mapstructure.StringToTimeDurationHookFunc(),
+			mapstructure.StringToWeakSliceHookFunc(","),
+		),
+	})
+	if err != nil {
 		return nil, "", fmt.Errorf("failed to unmarshal config: %w", err)
 	}
-	return cfg, v.ConfigFileUsed(), nil
+	if err := decoder.Decode(settings); err != nil {
+		return nil, "", fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+	return cfg, filePath, nil
 }

@@ -21,7 +21,6 @@ package server
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net"
 	"net/netip"
@@ -88,11 +87,7 @@ func ServeTCP(l net.Listener, h Handler, opts TCPServerOpts) error {
 					return // read err, close the connection
 				}
 
-				// Try to get server name from tls conn.
-				var serverName string
-				if tlsConn, ok := c.(*tls.Conn); ok {
-					serverName = tlsConn.ConnectionState().ServerName
-				}
+				serverName := tcpServerName(c)
 
 				// handle query
 				go func() {

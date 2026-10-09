@@ -20,19 +20,13 @@
 package coremain
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v5/mlog"
+	"github.com/IrineSistiana/mosdns/v5/pkg/metrics"
 	"github.com/IrineSistiana/mosdns/v5/pkg/safe_close"
-	"github.com/go-chi/chi/v5"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"io"
-	"net/http"
-	"net/http/pprof"
 )
 
 type Mosdns struct {
@@ -41,13 +35,16 @@ type Mosdns struct {
 	// Plugins
 	plugins map[string]any
 
-	httpMux    *chi.Mux
-	metricsReg *prometheus.Registry
+	apiState
+	metricsReg *metrics.Registry
 	sc         *safe_close.SafeClose
 }
 
 // NewMosdns initializes a mosdns instance and its plugins.
 func NewMosdns(cfg *Config) (*Mosdns, error) {
+	if err := validateProfileConfig(cfg); err != nil {
+		return nil, err
+	}
 	// Init logger.
 	lg, err := mlog.NewLogger(cfg.Log)
 	if err != nil {
@@ -57,33 +54,11 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 	m := &Mosdns{
 		logger:     lg,
 		plugins:    make(map[string]any),
-		httpMux:    chi.NewRouter(),
 		metricsReg: newMetricsReg(),
 		sc:         safe_close.NewSafeClose(),
 	}
-	// This must be called after m.httpMux and m.metricsReg been set.
-	m.initHttpMux()
-
-	// Start http api server
-	if httpAddr := cfg.API.HTTP; len(httpAddr) > 0 {
-		httpServer := &http.Server{
-			Addr:    httpAddr,
-			Handler: m.httpMux,
-		}
-		m.sc.Attach(func(done func(), closeSignal <-chan struct{}) {
-			defer done()
-			errChan := make(chan error, 1)
-			go func() {
-				m.logger.Info("starting api http server", zap.String("addr", httpAddr))
-				errChan <- httpServer.ListenAndServe()
-			}()
-			select {
-			case err := <-errChan:
-				m.sc.SendCloseSignal(err)
-			case <-closeSignal:
-				_ = httpServer.Close()
-			}
-		})
+	if err := m.initAPI(cfg.API); err != nil {
+		return nil, err
 	}
 
 	// Load plugins.
@@ -126,7 +101,7 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 func NewTestMosdnsWithPlugins(p map[string]any) *Mosdns {
 	return &Mosdns{
 		logger:     mlog.Nop(),
-		httpMux:    chi.NewRouter(),
+		apiState:   newAPIState(),
 		plugins:    p,
 		metricsReg: newMetricsReg(),
 		sc:         safe_close.NewSafeClose(),
@@ -152,56 +127,9 @@ func (m *Mosdns) GetPlugin(tag string) any {
 	return m.plugins[tag]
 }
 
-// GetMetricsReg returns a prometheus.Registerer with a prefix of "mosdns_"
-func (m *Mosdns) GetMetricsReg() prometheus.Registerer {
-	return prometheus.WrapRegistererWithPrefix("mosdns_", m.metricsReg)
-}
-
-func (m *Mosdns) GetAPIRouter() *chi.Mux {
-	return m.httpMux
-}
-
-func (m *Mosdns) RegPluginAPI(tag string, mux *chi.Mux) {
-	m.httpMux.Mount("/plugins/"+tag, mux)
-}
-
-func newMetricsReg() *prometheus.Registry {
-	reg := prometheus.NewRegistry()
-	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-	reg.MustRegister(collectors.NewGoCollector())
-	return reg
-}
-
-// initHttpMux initializes api entries. It MUST be called after m.metricsReg being initialized.
-func (m *Mosdns) initHttpMux() {
-	// Register metrics.
-	m.httpMux.Method(http.MethodGet, "/metrics", promhttp.HandlerFor(m.metricsReg, promhttp.HandlerOpts{}))
-
-	// Register pprof.
-	m.httpMux.Route("/debug/pprof", func(r chi.Router) {
-		r.Get("/*", pprof.Index)
-		r.Get("/cmdline", pprof.Cmdline)
-		r.Get("/profile", pprof.Profile)
-		r.Get("/symbol", pprof.Symbol)
-		r.Get("/trace", pprof.Trace)
-	})
-
-	// A helper page for invalid request.
-	invalidApiReqHelper := func(w http.ResponseWriter, req *http.Request) {
-		b := new(bytes.Buffer)
-		_, _ = fmt.Fprintf(b, "Invalid request %s %s\n\n", req.Method, req.RequestURI)
-		b.WriteString("Available api urls:\n")
-		_ = chi.Walk(m.httpMux, func(method string, route string, handler http.Handler, middlewares ...func(http.Handler) http.Handler) error {
-			b.WriteString(method)
-			b.WriteByte(' ')
-			b.WriteString(route)
-			b.WriteByte('\n')
-			return nil
-		})
-		_, _ = w.Write(b.Bytes())
-	}
-	m.httpMux.NotFound(invalidApiReqHelper)
-	m.httpMux.MethodNotAllowed(invalidApiReqHelper)
+// GetMetricsReg returns a metrics.Registerer with a prefix of "mosdns_"
+func (m *Mosdns) GetMetricsReg() metrics.Registerer {
+	return metrics.WrapRegistererWithPrefix("mosdns_", m.metricsReg)
 }
 
 func (m *Mosdns) loadPresetPlugins() error {
@@ -217,6 +145,9 @@ func (m *Mosdns) loadPresetPlugins() error {
 
 // loadPluginsFromCfg loads plugins from this config. It follows include first.
 func (m *Mosdns) loadPluginsFromCfg(cfg *Config, includeDepth int) error {
+	if err := validateProfileConfig(cfg); err != nil {
+		return err
+	}
 	const maxIncludeDepth = 8
 	if includeDepth > maxIncludeDepth {
 		return errors.New("maximum include depth reached")

@@ -1,3 +1,5 @@
+//go:build !mosdns_minimal
+
 package transport
 
 import (

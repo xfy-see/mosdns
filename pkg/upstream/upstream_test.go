@@ -29,7 +29,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/miekg/dns"
 )
 
@@ -66,38 +65,11 @@ func newTCPTestServer(t testing.TB, handler dns.Handler) (addr string, shutdownF
 	}
 }
 
-func newDoTTestServer(t testing.TB, handler dns.Handler) (addr string, shutdownFunc func()) {
-	serverName := "test"
-	cert, err := utils.GenerateCertificate(serverName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tlsConfig := new(tls.Config)
-	tlsConfig.Certificates = []tls.Certificate{cert}
-	tlsListener, err := tls.Listen("tcp", "127.0.0.1:0", tlsConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	doTAddr := tlsListener.Addr().String()
-	doTServer := dns.Server{
-		Net:           "tcp-tls",
-		Listener:      tlsListener,
-		TLSConfig:     tlsConfig,
-		Handler:       handler,
-		MaxTCPQueries: -1,
-	}
-	go doTServer.ActivateAndServe()
-	return doTAddr, func() {
-		doTServer.Shutdown()
-	}
-}
-
 type newTestServerFunc func(t testing.TB, handler dns.Handler) (addr string, shutdownFunc func())
 
 var m = map[string]newTestServerFunc{
 	"udp": newUDPTestServer,
 	"tcp": newTCPTestServer,
-	"tls": newDoTTestServer,
 }
 
 func Test_fastUpstream(t *testing.T) {

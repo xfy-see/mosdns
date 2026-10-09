@@ -34,50 +34,76 @@ var _ WriteableMatcher[any] = (*FullMatcher[any])(nil)
 var _ WriteableMatcher[any] = (*KeywordMatcher[any])(nil)
 var _ WriteableMatcher[any] = (*RegexMatcher[any])(nil)
 
+// Each suffix shares one table instead of allocating a node and map for every
+// branching label. Internal suffixes retain child information so Match can stop
+// as soon as a rule has no more specific descendants.
+type subDomainValue[T any] struct {
+	v           T
+	hasValue    bool
+	hasChildren bool
+}
+
 type SubDomainMatcher[T any] struct {
-	root *labelNode[T]
+	domains map[string]subDomainValue[T]
+	root    T
+	hasRoot bool
+	length  int
 }
 
 func NewSubDomainMatcher[T any]() *SubDomainMatcher[T] {
-	return &SubDomainMatcher[T]{root: new(labelNode[T])}
+	return &SubDomainMatcher[T]{domains: make(map[string]subDomainValue[T])}
 }
 
 func (m *SubDomainMatcher[T]) Match(s string) (T, bool) {
-	s = NormalizeDomain(s)
-	ds := NewReverseDomainScanner(s)
-	currentNode := m.root
-	v, ok := currentNode.getValue()
+	ds := NewReverseDomainScanner(NormalizeDomain(s))
+	v, ok := m.root, m.hasRoot
 	for ds.Scan() {
-		label := ds.NextLabel()
-		if nextNode := currentNode.getChild(label); nextNode != nil {
-			if nextNode.hasValue() {
-				v, ok = nextNode.getValue()
-			}
-			currentNode = nextNode
-		} else {
+		entry, exists := m.domains[ds.s[ds.NextLabelOffset():]]
+		if !exists {
+			break
+		}
+		if entry.hasValue {
+			v, ok = entry.v, true
+		}
+		if !entry.hasChildren {
 			break
 		}
 	}
 	return v, ok
 }
 
-func (m *SubDomainMatcher[T]) Len() int {
-	return m.root.len()
-}
+func (m *SubDomainMatcher[T]) Len() int { return m.length }
 
 func (m *SubDomainMatcher[T]) Add(s string, v T) error {
-	s = NormalizeDomain(s)
-	ds := NewReverseDomainScanner(s)
-	currentNode := m.root
+	ds := NewReverseDomainScanner(NormalizeDomain(s))
+	var parent string
+	hasParent := false
 	for ds.Scan() {
-		label := ds.NextLabel()
-		if child := currentNode.getChild(label); child != nil {
-			currentNode = child
-		} else {
-			currentNode = currentNode.newChild(label)
+		if hasParent {
+			entry := m.domains[parent]
+			if !entry.hasChildren {
+				entry.hasChildren = true
+				m.domains[parent] = entry
+			}
+		}
+		parent = ds.s[ds.NextLabelOffset():]
+		hasParent = true
+		if _, exists := m.domains[parent]; !exists {
+			m.domains[parent] = subDomainValue[T]{}
 		}
 	}
-	currentNode.storeValue(v)
+	if hasParent {
+		entry := m.domains[parent]
+		if !entry.hasValue {
+			m.length++
+		}
+		entry.v, entry.hasValue = v, true
+		m.domains[parent] = entry
+	} else {
+		// Preserve the existing reverse scanner's convention: a root rule matches
+		// everything but does not contribute to Len.
+		m.root, m.hasRoot = v, true
+	}
 	return nil
 }
 

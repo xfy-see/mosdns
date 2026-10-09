@@ -1,3 +1,5 @@
+//go:build !mosdns_minimal
+
 /*
  * Copyright (C) 2020-2022, IrineSistiana
  *
@@ -21,6 +23,7 @@ package server
 
 import (
 	"crypto/tls"
+	"net"
 )
 
 func LoadCert(tlsCfg *tls.Config, cert, key string) error {
@@ -30,4 +33,11 @@ func LoadCert(tlsCfg *tls.Config, cert, key string) error {
 	}
 	tlsCfg.Certificates = []tls.Certificate{c}
 	return nil
+}
+
+func tcpServerName(c net.Conn) string {
+	if tc, ok := c.(*tls.Conn); ok {
+		return tc.ConnectionState().ServerName
+	}
+	return ""
 }

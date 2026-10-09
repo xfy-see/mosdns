@@ -23,3 +23,9 @@ release/
 
 # test utils
 testutils/
+
+# Local migration toolchains and build outputs
+.build/
+target/
+benchmarks/bin/
+benchmarks/__pycache__/

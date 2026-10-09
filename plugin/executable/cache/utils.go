@@ -44,6 +44,11 @@ func getMsgKey(q *dns.Msg) string {
 	if q.Response || q.Opcode != dns.OpcodeQuery || len(q.Question) != 1 {
 		return ""
 	}
+	// The v2 cache key does not encode class. Preserve the existing INET key
+	// format, and forward other classes without reading or writing this cache.
+	if q.Question[0].Qclass != dns.ClassINET {
+		return ""
+	}
 
 	const (
 		adBit = 1 << iota
@@ -67,7 +72,7 @@ func getMsgKey(q *dns.Msg) string {
 		b = b | doBit
 	}
 	buf[0] = b
-	buf[1] = byte(question.Qtype << 8)
+	buf[1] = byte(question.Qtype >> 8)
 	buf[2] = byte(question.Qtype)
 	buf[3] = byte(len(question.Name))
 	copy(buf[4:], question.Name)

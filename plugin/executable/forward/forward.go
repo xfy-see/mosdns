@@ -21,7 +21,6 @@ package fastforward
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -29,13 +28,13 @@ import (
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
+	"github.com/IrineSistiana/mosdns/v5/pkg/metrics"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/pkg/upstream"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/miekg/dns"
-	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 )
 
@@ -88,9 +87,11 @@ func Init(bp *coremain.BP, args any) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := f.RegisterMetricsTo(prometheus.WrapRegistererWithPrefix(PluginType+"_", bp.M().GetMetricsReg())); err != nil {
-		_ = f.Close()
-		return nil, err
+	if metricsEnabled {
+		if err := f.RegisterMetricsTo(metrics.WrapRegistererWithPrefix(PluginType+"_", bp.M().GetMetricsReg())); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
 	}
 	return f, nil
 }
@@ -137,11 +138,18 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 
 	for i, c := range args.Upstreams {
 		if len(c.Addr) == 0 {
+			_ = f.Close()
 			return nil, fmt.Errorf("#%d upstream invalid args, addr is required", i)
 		}
 		applyGlobal(&c)
 
 		uw := newWrapper(i, c, opt.MetricsTag)
+		tlsConfig, err := profileTLSConfig(c)
+		if err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("failed to init upstream #%d: %w", i, err)
+		}
+
 		uOpt := upstream.Opt{
 			DialAddr:       c.DialAddr,
 			Socks5:         c.Socks5,
@@ -152,12 +160,9 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 			EnableHTTP3:    c.EnableHTTP3,
 			Bootstrap:      c.Bootstrap,
 			BootstrapVer:   c.BootstrapVer,
-			TLSConfig: &tls.Config{
-				InsecureSkipVerify: c.InsecureSkipVerify,
-				ClientSessionCache: tls.NewLRUClientSessionCache(4),
-			},
-			Logger:        opt.Logger,
-			EventObserver: uw,
+			TLSConfig:      tlsConfig,
+			Logger:         opt.Logger,
+			EventObserver:  uw,
 		}
 
 		u, err := upstream.NewUpstream(c.Addr, uOpt)
@@ -180,7 +185,10 @@ func NewForward(args *Args, opt Opts) (*Forward, error) {
 	return f, nil
 }
 
-func (f *Forward) RegisterMetricsTo(r prometheus.Registerer) error {
+func (f *Forward) RegisterMetricsTo(r metrics.Registerer) error {
+	if !metricsEnabled {
+		return fmt.Errorf("forward metrics are not available in the mosdns_minimal build")
+	}
 	for _, wu := range f.us {
 		// Only register metrics for upstream that has a tag.
 		if len(wu.cfg.Tag) == 0 {

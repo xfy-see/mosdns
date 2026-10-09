@@ -126,10 +126,12 @@ func (m *shard[K, V]) set(key K, v V) {
 	m.l.Lock()
 	defer m.l.Unlock()
 	if m.max > 0 && len(m.m)+1 > m.max {
-		for k := range m.m {
-			delete(m.m, k)
-			if len(m.m)+1 <= m.max {
-				break
+		if _, exists := m.m[key]; !exists {
+			for k := range m.m {
+				delete(m.m, k)
+				if len(m.m)+1 <= m.max {
+					break
+				}
 			}
 		}
 	}
@@ -162,8 +164,8 @@ func (m *shard[K, V]) len() int {
 }
 
 func (m *shard[K, V]) flush() {
-	m.l.RLock()
-	defer m.l.RUnlock()
+	m.l.Lock()
+	defer m.l.Unlock()
 	m.m = make(map[K]V)
 }
 

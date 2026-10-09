@@ -189,14 +189,20 @@ func (dc *TraditionalDnsConn) readLoop() {
 		dc.waitingResp.Store(false)
 
 		rid := binary.BigEndian.Uint16(*r)
-		resChan := dc.getQueueC(rid)
+		// Keep lookup and delivery inside the same read lock. Query cleanup
+		// cannot remove and drain the queue before this sender finishes.
+		dc.queueMu.RLock()
+		resChan := dc.queue[uint32(rid)]
+		delivered := false
 		if resChan != nil {
 			select {
-			case resChan <- r: // resChan has buffer
+			case resChan <- r:
+				delivered = true
 			default:
-				pool.ReleaseBuf(r)
 			}
-		} else {
+		}
+		dc.queueMu.RUnlock()
+		if !delivered {
 			pool.ReleaseBuf(r)
 		}
 	}
@@ -228,12 +234,6 @@ func (dc *TraditionalDnsConn) CloseWithErr(err error) {
 	})
 }
 
-func (dc *TraditionalDnsConn) getQueueC(qid uint16) chan<- *[]byte {
-	dc.queueMu.RLock()
-	defer dc.queueMu.RUnlock()
-	return dc.queue[uint32(qid)]
-}
-
 func (dc *TraditionalDnsConn) queueLen() int {
 	dc.queueMu.RLock()
 	defer dc.queueMu.RUnlock()
@@ -244,7 +244,9 @@ func (dc *TraditionalDnsConn) queueLen() int {
 // It returns a nil c if queue has too many queries.
 // Caller must call deleteQueueC to release the qid in queue.
 func (dc *TraditionalDnsConn) addQueueC() (qid uint16, c chan *[]byte) {
-	c = make(chan *[]byte)
+	// A reply may arrive before Write returns and exchange starts receiving.
+	// One slot retains that first reply; duplicate replies are released.
+	c = make(chan *[]byte, 1)
 	dc.queueMu.Lock()
 	for i := 0; i < 100; i++ {
 		qid = dc.nextQid
@@ -264,7 +266,16 @@ func (dc *TraditionalDnsConn) addQueueC() (qid uint16, c chan *[]byte) {
 
 func (dc *TraditionalDnsConn) deleteQueueC(qid uint16) {
 	dc.queueMu.Lock()
+	c := dc.queue[uint32(qid)]
 	delete(dc.queue, uint32(qid))
+	if c != nil {
+		select {
+		case r := <-c:
+			// Cancellation/closure/failed Write can leave a reply queued.
+			pool.ReleaseBuf(r)
+		default:
+		}
+	}
 	dc.queueMu.Unlock()
 }
 

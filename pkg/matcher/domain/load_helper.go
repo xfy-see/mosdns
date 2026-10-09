@@ -21,6 +21,7 @@ package domain
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
@@ -54,6 +55,10 @@ func Load[T any](m WriteableMatcher[T], s string, parseString ParseStringFunc[T]
 
 // LoadFromTextReader loads multiple lines from reader r. r
 func LoadFromTextReader[T any](m WriteableMatcher[T], r io.Reader, parseString ParseStringFunc[T]) error {
+	if parseString == nil {
+		return loadPatternsFromTextReader(m, r)
+	}
+	// Custom parsers keep their existing streaming callback behavior.
 	lineCounter := 0
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
@@ -69,6 +74,53 @@ func LoadFromTextReader[T any](m WriteableMatcher[T], r io.Reader, parseString P
 		if err != nil {
 			return fmt.Errorf("line %d: %v", lineCounter, err)
 		}
+	}
+	return scanner.Err()
+}
+
+// Freeze a small batch into one immutable string. Matchers retain slices of
+// this string rather than a separate allocation for every rule in a large set.
+// Scanner's original line length limit, line numbers, and partial-load errors
+// are retained. Empty lines and comments are not stored in the batch.
+func loadPatternsFromTextReader[T any](m WriteableMatcher[T], r io.Reader) error {
+	const batchSize = 32 << 10
+	type line struct{ number, start, end int }
+	data := make([]byte, 0, batchSize)
+	lines := make([]line, 0, 1024)
+	flush := func() error {
+		text := string(data)
+		for _, l := range lines {
+			if err := Load(m, text[l.start:l.end], nil); err != nil {
+				return fmt.Errorf("line %d: %v", l.number, err)
+			}
+		}
+		data = data[:0]
+		lines = lines[:0]
+		return nil
+	}
+	scanner := bufio.NewScanner(r)
+	lineCounter := 0
+	for scanner.Scan() {
+		lineCounter++
+		s := scanner.Bytes()
+		if i := bytes.IndexByte(s, '#'); i >= 0 {
+			s = s[:i]
+		}
+		s = bytes.TrimSpace(s)
+		if len(s) == 0 {
+			continue
+		}
+		if len(data)+len(s) > batchSize {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		start := len(data)
+		data = append(data, s...)
+		lines = append(lines, line{lineCounter, start, len(data)})
+	}
+	if err := flush(); err != nil {
+		return err
 	}
 	return scanner.Err()
 }

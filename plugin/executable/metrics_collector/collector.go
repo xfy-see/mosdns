@@ -22,9 +22,9 @@ package metrics_collector
 import (
 	"context"
 	"errors"
+	"github.com/IrineSistiana/mosdns/v5/pkg/metrics"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
-	"github.com/prometheus/client_golang/prometheus"
 	"time"
 )
 
@@ -37,44 +37,44 @@ func init() {
 var _ sequence.RecursiveExecutable = (*Collector)(nil)
 
 type Collector struct {
-	queryTotal      prometheus.Counter
-	errTotal        prometheus.Counter
-	thread          prometheus.Gauge
-	responseLatency prometheus.Histogram
+	queryTotal      metrics.Counter
+	errTotal        metrics.Counter
+	thread          metrics.Gauge
+	responseLatency metrics.Histogram
 }
 
 // NewCollector inits a new Collector with given name to r.
 // name must be unique in the r.
-func NewCollector(r prometheus.Registerer, name string) (*Collector, error) {
+func NewCollector(r metrics.Registerer, name string) (*Collector, error) {
 	if len(name) == 0 {
 		return nil, errors.New("collector must has a name")
 	}
 
 	lb := map[string]string{"name": name}
 	var c = &Collector{
-		queryTotal: prometheus.NewCounter(prometheus.CounterOpts{
+		queryTotal: metrics.NewCounter(metrics.CounterOpts{
 			Name:        "query_total",
 			Help:        "The total number of queries pass through",
 			ConstLabels: lb,
 		}),
-		errTotal: prometheus.NewCounter(prometheus.CounterOpts{
+		errTotal: metrics.NewCounter(metrics.CounterOpts{
 			Name:        "err_total",
 			Help:        "The total number of queries failed",
 			ConstLabels: lb,
 		}),
-		thread: prometheus.NewGauge(prometheus.GaugeOpts{
+		thread: metrics.NewGauge(metrics.GaugeOpts{
 			Name:        "thread",
 			Help:        "The number of threads that are currently being processed",
 			ConstLabels: lb,
 		}),
-		responseLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
+		responseLatency: metrics.NewHistogram(metrics.HistogramOpts{
 			Name:        "response_latency_millisecond",
 			Help:        "The response latency in millisecond",
 			Buckets:     []float64{1, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000},
 			ConstLabels: lb,
 		}),
 	}
-	for _, collector := range [...]prometheus.Collector{c.queryTotal, c.errTotal, c.thread, c.responseLatency} {
+	for _, collector := range [...]metrics.Collector{c.queryTotal, c.errTotal, c.thread, c.responseLatency} {
 		if err := r.Register(collector); err != nil {
 			return nil, err
 		}
@@ -100,6 +100,6 @@ func (c *Collector) Exec(ctx context.Context, qCtx *query_context.Context, next 
 
 // QuickSetup format: metrics_name
 func QuickSetup(bp sequence.BQ, s string) (any, error) {
-	r := prometheus.WrapRegistererWithPrefix(PluginType+"_", bp.M().GetMetricsReg())
+	r := metrics.WrapRegistererWithPrefix(PluginType+"_", bp.M().GetMetricsReg())
 	return NewCollector(r, s)
 }

@@ -1,3 +1,5 @@
+//go:build !mosdns_minimal
+
 /*
  * Copyright (C) 2020-2022, IrineSistiana
  *
@@ -113,6 +115,7 @@ func ServeDoQ(l *quic.Listener, h Handler, opts DoQServerOpts) error {
 					if resp == nil {
 						return
 					}
+					defer pool.ReleaseBuf(resp)
 					if _, err := stream.Write(*resp); err != nil {
 						logger.Warn("failed to write response", zap.Stringer("client", c.RemoteAddr()), zap.Error(err))
 					}

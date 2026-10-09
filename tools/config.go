@@ -21,8 +21,10 @@ package tools
 
 import (
 	"github.com/IrineSistiana/mosdns/v5/mlog"
+	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -35,7 +37,7 @@ func newConvCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "conv -i input_cfg -o output_cfg",
 		Args:  cobra.NoArgs,
-		Short: "Convert configuration file format. Supported extensions: " + strings.Join(viper.SupportedExts, ", "),
+		Short: "Convert configuration file format. Supported extensions: yaml, yml, json",
 		Run: func(cmd *cobra.Command, args []string) {
 			if err := convCfg(in, out); err != nil {
 				mlog.S().Fatal(err)
@@ -55,7 +57,7 @@ func newConvCmd() *cobra.Command {
 func newGenCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "gen config_file",
-		Short: "Generate a template config. Supported extensions: " + strings.Join(viper.SupportedExts, ", "),
+		Short: "Generate a template config. Supported extensions: yaml, yml, json",
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			if err := genCfg(args[0]); err != nil {
@@ -68,12 +70,11 @@ func newGenCmd() *cobra.Command {
 }
 
 func convCfg(in, out string) error {
-	v := viper.New()
-	v.SetConfigFile(in)
-	if err := v.ReadInConfig(); err != nil {
+	values, err := utils.ReadConfigMap(in)
+	if err != nil {
 		return err
 	}
-	return v.SafeWriteConfigAs(out)
+	return writeConfigMap(out, values, "", false)
 }
 
 func genCfg(out string) error {
@@ -99,11 +100,34 @@ plugins:
       entry: forward_google
       listen: "127.0.0.1:53"
 `
-	v := viper.New()
-	v.SetConfigType("yaml")
-	if err := v.ReadConfig(strings.NewReader(cfg)); err != nil {
+	values, err := utils.DecodeConfigMap([]byte(cfg), "yaml")
+	if err != nil {
 		return err
 	}
 
-	return v.WriteConfigAs(out)
+	return writeConfigMap(out, values, "yaml", true)
+}
+
+func writeConfigMap(out string, values map[string]any, defaultFormat string, overwrite bool) error {
+	format := strings.TrimPrefix(filepath.Ext(out), ".")
+	if format == "" {
+		format = defaultFormat
+	}
+	data, err := utils.EncodeConfigMap(values, format)
+	if err != nil {
+		return err
+	}
+	flags := os.O_CREATE | os.O_TRUNC | os.O_WRONLY
+	if !overwrite {
+		flags |= os.O_EXCL
+	}
+	f, err := os.OpenFile(out, flags, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	return f.Sync()
 }

@@ -27,10 +27,12 @@ import (
 	"io"
 	"net/http"
 	urlpkg "net/url"
+	"sync"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
+	"github.com/IrineSistiana/mosdns/v5/pkg/upstream/transport"
 	"github.com/IrineSistiana/mosdns/v5/pkg/utils"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
@@ -48,6 +50,15 @@ type Upstream struct {
 	logger      *zap.Logger // non-nil
 	urlTemplate *urlpkg.URL
 	reqTemplate *http.Request
+
+	// Close cancels pending HTTP requests as well as discarding idle transports.
+	ctx       context.Context
+	cancel    context.CancelCauseFunc
+	closeOnce sync.Once
+	closeErr  error
+	mu        sync.Mutex
+	closed    bool
+	active    sync.WaitGroup
 }
 
 func NewUpstream(endPoint string, rt http.RoundTripper, logger *zap.Logger) (*Upstream, error) {
@@ -62,7 +73,10 @@ func NewUpstream(endPoint string, rt http.RoundTripper, logger *zap.Logger) (*Up
 	if logger == nil {
 		logger = nopLogger
 	}
+	ctx, cancel := context.WithCancelCause(context.Background())
 	return &Upstream{
+		ctx:         ctx,
+		cancel:      cancel,
 		rt:          rt,
 		logger:      logger,
 		urlTemplate: req.URL,
@@ -70,11 +84,37 @@ func NewUpstream(endPoint string, rt http.RoundTripper, logger *zap.Logger) (*Up
 	}, nil
 }
 
+// Close is safe to call concurrently and releases the HTTP transport once.
+func (u *Upstream) Close() error {
+	u.closeOnce.Do(func() {
+		u.mu.Lock()
+		u.closed = true
+		u.cancel(transport.ErrClosedTransport)
+		u.mu.Unlock()
+		// HTTP/2 closes only idle connections. Wait for canceled streams to
+		// finish before discarding its pool, including detached caller queries.
+		u.active.Wait()
+		if c, ok := u.rt.(io.Closer); ok {
+			u.closeErr = c.Close()
+		} else if c, ok := u.rt.(interface{ CloseIdleConnections() }); ok {
+			c.CloseIdleConnections()
+		}
+	})
+	return u.closeErr
+}
+
 var (
 	bufPool4k = pool.NewBytesBufPool(4096)
 )
 
 func (u *Upstream) ExchangeContext(ctx context.Context, q []byte) (*[]byte, error) {
+	u.mu.Lock()
+	if u.closed {
+		u.mu.Unlock()
+		return nil, transport.ErrClosedTransport
+	}
+	u.active.Add(1)
+	u.mu.Unlock()
 	bp := pool.GetBuf(len(q))
 	defer pool.ReleaseBuf(bp)
 	wire := *bp
@@ -103,19 +143,28 @@ func (u *Upstream) ExchangeContext(ctx context.Context, q []byte) (*[]byte, erro
 		err error
 	}
 
-	resChan := make(chan res, 1)
+	// An unbuffered handoff transfers ownership only if the caller's select
+	// receives it. If cancellation wins, the worker retains and returns the buffer.
+	resChan := make(chan res)
 	go func() {
+		defer u.active.Done()
 		// We overwrite the ctx with a fixed timeout context here.
 		// Because the http package may close the underlay connection
 		// if the context is done before the query is completed. This
 		// reduces the connection reuse efficiency.
-		ctx, cancel := context.WithTimeout(context.Background(), defaultDoHTimeout)
+		requestCtx, cancel := context.WithTimeout(u.ctx, defaultDoHTimeout)
 		defer cancel()
-		r, err := u.exchange(ctx, utils.BytesToStringUnsafe(queryBuf))
+		r, err := u.exchange(requestCtx, utils.BytesToStringUnsafe(queryBuf))
 		if err != nil {
 			u.logger.Check(zap.WarnLevel, "exchange failed").Write(zap.Error(err))
 		}
-		resChan <- res{r: r, err: err}
+		select {
+		case resChan <- res{r: r, err: err}:
+		case <-ctx.Done():
+			if r != nil {
+				pool.ReleaseBuf(r)
+			}
+		}
 	}()
 
 	select {
