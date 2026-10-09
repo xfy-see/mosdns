@@ -124,9 +124,11 @@ def main():
         if release['body'].rstrip('\n') != NOTES.read_text().rstrip('\n') or release['name'] != TITLE:
             raise RuntimeError('existing release description differs')
     else:
-        gh('release', 'create', TAG, '--repo', REPO, '--verify-tag', '--target', COMMIT,
-           '--draft', '--title', TITLE, '--notes-file', str(NOTES))
-        release = api('releases/tags/' + TAG)
+        release = json.loads(gh('api', '--method', 'POST', 'repos/' + REPO + '/releases',
+            '--input', '-', input_data=json.dumps({
+                'tag_name': TAG, 'target_commitish': COMMIT, 'draft': True,
+                'name': TITLE, 'body': NOTES.read_text(), 'prerelease': False,
+            })))
     if not check_tag():
         raise RuntimeError('draft release did not create the selected tag')
     present = release_assets(release, expected)
@@ -137,13 +139,13 @@ def main():
         for path in assets:
             if path.name not in present:
                 gh('release', 'upload', TAG, str(path), '--repo', REPO)
-        release = api('releases/tags/' + TAG)
+        release = api('releases/' + str(release['id']))
         if release_assets(release, expected) != set(expected):
             raise RuntimeError('draft upload incomplete')
         if not check_tag():
             raise RuntimeError('release tag disappeared before publication')
         gh('release', 'edit', TAG, '--repo', REPO, '--draft=false', '--latest')
-    release = api('releases/tags/' + TAG)
+    release = api('releases/' + str(release['id']))
     if not check_tag():
         raise RuntimeError('published release tag is missing')
     if release['draft'] or release_assets(release, expected) != set(expected):
